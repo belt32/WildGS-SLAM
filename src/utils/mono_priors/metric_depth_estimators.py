@@ -98,7 +98,7 @@ def predict_metric_depth(
         output = _predict_metric3d_depth(model, input_tensor, cfg, device)
     elif "dpt2" in depth_model:
         # dpt2 model takes np.uint8 as the dtype of input
-        input_numpy = (255.0 * input.squeeze().permute(1, 2, 0).cpu().numpy()).astype(
+        input_numpy = (255.0 * input_tensor.squeeze().permute(1, 2, 0).cpu().numpy()).astype(
             np.uint8
         )
         depth = model.infer_image(input_numpy, input_size=518)
