@@ -66,6 +66,9 @@ class GaussianModel:
 
         self.isotropic = False
 
+        self._is_dynamic = torch.empty(0, device="cuda")
+        self._uncertainty_beta = torch.empty(0, device="cuda")
+
     def build_covariance_from_scaling_rotation(
         self, scaling, scaling_modifier, rotation
     ):
@@ -90,6 +93,13 @@ class GaussianModel:
     def get_features(self):
         features_dc = self._features_dc
         features_rest = self._features_rest
+
+        if self._is_dynamic.any():
+            # Overwrite RGB color for dynamic Gaussians with red in SH format
+            red_sh = torch.tensor([0.886, -0.886 * 0.33, -0.886 * 0.33], device="cuda")
+            dynamic_indices = self._is_dynamic.nonzero(as_tuple=True)[0]
+            features_dc[dynamic_indices, :3] = red_sh
+
         return torch.cat((features_dc, features_rest), dim=1)
 
     @property
@@ -609,6 +619,8 @@ class GaussianModel:
         new_rotation,
         new_kf_ids=None,
         new_n_obs=None,
+        new_is_dynamic=None,
+        new_uncertainty_beta=None,
     ):
         d = {
             "xyz": new_xyz,
@@ -619,12 +631,8 @@ class GaussianModel:
             "rotation": new_rotation,
         }
 
-        # The cat_tensors_to_optimizer updates the self.optimizer interal
-        # variables accounting for the new Gaussians and also concatenates
-        # the actual optimizable parameters, but does not update the global
-        # attributes.
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
-        # Update the global attributes
+
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
@@ -635,13 +643,15 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
         if new_kf_ids is not None:
             self.unique_kfIDs = torch.cat((self.unique_kfIDs, new_kf_ids)).int()
-        # self.n_obs describes how many times the Gaussian has been observed
-        # which I suppose is related to from how many frames it is denoted
-        # visible
         if new_n_obs is not None:
             self.n_obs = torch.cat((self.n_obs, new_n_obs)).int()
+        if new_is_dynamic is not None:
+            self._is_dynamic = torch.cat((self._is_dynamic, new_is_dynamic))
+        if new_uncertainty_beta is not None:
+            self._uncertainty_beta = torch.cat((self._uncertainty_beta, new_uncertainty_beta))
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]

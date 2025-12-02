@@ -37,6 +37,7 @@ from src.utils.Printer import Printer, FontColor
 from src.utils.pose_utils import update_pose
 from src.utils.slam_utils import (
     get_loss_mapping,
+    
     get_loss_mapping_uncertainty,
     get_loss_tracking,
 )
@@ -138,6 +139,20 @@ class Mapper(object):
         self.q_main2vis = q_main2vis
         self.q_vis2main = q_vis2main
         self.pause = False
+
+        # Load thermal parameters
+        thermal_config = self.config['thermal']
+        self.thermal_T_rgb_thermal = np.array(thermal_config['T_rgb_thermal'])
+        self.thermal_K_thermal = np.array(thermal_config['K_thermal'])
+
+        # Prepare thermal_info dictionary
+        self.thermal_info = {
+            'thermal_image': None,  # Placeholder, to be updated dynamically
+            'T_rgb_thermal': self.thermal_T_rgb_thermal,
+            'K_thermal': self.thermal_K_thermal,
+            'thermal_threshold': thermal_config['thermal_threshold'],
+            'lambda_beta_ext': thermal_config['lambda_beta_ext']
+        }
 
     def run(self):
         """
@@ -683,7 +698,6 @@ class Mapper(object):
             # we need to find the keyframe to remove...
             inv_dist = []
             for i in range(N_dont_touch, len(window)):
-                inv_dists = []
                 kf_i_idx = window[i]
                 kf_i = self.cameras[kf_i_idx]
                 kf_i_CW = getWorld2View2(kf_i.R, kf_i.T)
@@ -822,7 +836,7 @@ class Mapper(object):
             torch.Tensor: Refined world-to-camera transformation.
         """
         # We always use the downsampled image for tracking.
-        # Full resolution only for the mapping even if it's activated.
+        # Full resolution only for mapping even if it's activated.
         color = self.frame_reader.get_color(frame_idx).to(self.device).squeeze()
 
         data = {
@@ -971,6 +985,10 @@ class Mapper(object):
                     depth = F.interpolate(
                         depth.unsqueeze(0), viewpoint.depth.shape, mode="bicubic"
                     ).squeeze(0)
+                # Update thermal image in thermal_info
+                self.thermal_info['thermal_image'] = self.frame_reader.get_thermal_image(frame_idx)
+
+                # Call get_loss_mapping_uncertainty with updated arguments
                 current_uncertainty, loss_init = get_loss_mapping_uncertainty(
                     self.config["mapping"],
                     image,
@@ -981,6 +999,8 @@ class Mapper(object):
                     train_frac,
                     ssim_frac,
                     initialization=True,
+                    gaussians=self.gaussians,
+                    thermal_info=self.thermal_info
                 )
 
                 stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
@@ -1034,7 +1054,27 @@ class Mapper(object):
 
                 self.frame_count_log[kf_idx] += 1
 
-            self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
+            # After densification, process new Gaussians with thermal mask
+            thermal_image = self.frame_reader.get_thermal_image()  # Example method to fetch thermal image
+            T_rgb_thermal = self.config['thermal']['T_rgb_thermal']
+            K_thermal = self.config['thermal']['K_thermal']
+            rgb_shape = (self.config['rgb']['height'], self.config['rgb']['width'])
+
+            # Generate calibrated thermal mask
+            thermal_mask = thermal_prior_utils.get_calibrated_thermal_mask(
+                thermal_image, T_rgb_thermal, K_thermal, rgb_shape
+            )
+
+            # Iterate over new Gaussians and update their dynamic status
+            for gaussian in self.gaussians.get_new_gaussians():
+                projected_coords = gaussian.project_to_2d(self.intrinsics, self.projection_matrix)
+                x, y = int(projected_coords[0]), int(projected_coords[1])
+
+                if 0 <= x < rgb_shape[1] and 0 <= y < rgb_shape[0]:
+                    if thermal_mask[y, x] > 0:  # Check if inside thermal mask
+                        gaussian.is_dynamic = True
+                        gaussian.uncertainty_beta = 0.9
+
         self.printer.print("Initialized map", FontColor.MAPPER)
 
         # online plotting
@@ -1126,7 +1166,7 @@ class Mapper(object):
                     current_loss_mapping,
                 ) = get_loss_mapping_uncertainty(
                     self.config["mapping"],
-                    (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b,
+                    image,
                     depth,
                     viewpoint,
                     opacity,
@@ -1134,6 +1174,8 @@ class Mapper(object):
                     train_frac,
                     ssim_frac,
                     freeze_uncertainty_loss=self.iterations_after_densify_or_reset < 20,
+                    gaussians=self.gaussians,
+                    thermal_info=self.thermal_info
                 )
                 loss_mapping += current_loss_mapping
 
@@ -1306,6 +1348,8 @@ class Mapper(object):
                     ssim_frac,
                     freeze_uncertainty_loss=self.iterations_after_densify_or_reset
                     < 200,
+                    gaussians=self.gaussians,
+                    thermal_info=self.thermal_info
                 )
                 loss_mapping += loss_mapping_this_frame
 
@@ -1651,3 +1695,24 @@ class Mapper(object):
             save_path = os.path.join(self.save_dir, "online_uncer", f"{cur_idx}.png")
         plt.savefig(save_path, bbox_inches="tight")
         plt.close()
+
+        # Spatiotemporal filtering for dynamic Gaussians
+            N = 5  # Number of frames to check
+            movement_threshold = 0.01  # Threshold in meters
+
+            for gaussian in self.gaussians.get_dynamic_gaussians():
+                recent_positions = gaussian.get_recent_positions(N)
+
+                if len(recent_positions) < N:
+                    continue  # Skip if not enough history
+
+                # Calculate total movement over the last N frames
+                total_movement = sum(
+                    torch.norm(recent_positions[i] - recent_positions[i - 1])
+                    for i in range(1, len(recent_positions))
+                )
+
+                if total_movement < movement_threshold:
+                    # Mark Gaussian as static and reintegrate into the static map
+                    gaussian.is_dynamic = False
+                    self.gaussians.reintegrate_to_static_map(gaussian)

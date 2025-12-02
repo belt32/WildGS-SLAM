@@ -5,6 +5,9 @@ from torch.nn import Module
 import torch.nn.functional as F
 from thirdparty.gaussian_splatting.utils.loss_utils import ssim
 from src.utils.dyn_uncertainty import mapping_utils as map_utils
+import cv2
+import numpy as np
+from src.utils.thermal_prior_utils import get_calibrated_thermal_mask
 
 
 def image_gradient(image):
@@ -144,37 +147,36 @@ def get_loss_mapping_rgbd(config, image, depth, viewpoint):
 
 
 def get_loss_mapping_uncertainty(
-    config: Dict,
-    rendered_img: Tensor,
-    rendered_depth: Tensor,
-    viewpoint, # from src.utils.camera_utils import Camera, to avoid loop import
-    opacity: Tensor,
-    uncertainty_network: Module,
-    train_frac: float,
-    ssim_frac: float,
-    initialization: bool = False,
-    freeze_uncertainty_loss: bool = False,  # Renamed parameter
-) -> Tuple[Tensor, Tensor]:
-    """Compute mapping loss with uncertainty estimation for SLAM system.
-    
-    Estimates per-pixel uncertainty and combines RGB + depth losses with uncertainty 
-    weighting to handle dynamic objects.
+    rendered_img, rendered_depth, opacity, viewpoint, uncertainty_network, map_utils,
+    config, train_frac=0.5, ssim_frac=0.5, initialization=False, freeze_uncertainty_loss=False,
+    thermal_mask=None, thermal_image=None, T_rgb_thermal=None, K_thermal=None,
+    gaussians=None, thermal_info=None
+):
+    """
+    Compute the mapping and uncertainty loss for SLAM.
 
     Args:
-        config: Configuration parameters
-        rendered_img: Rendered RGB image (3, H, W)
-        rendered_depth: Rendered depth map (1, H, W)
-        viewpoint: Camera containing ground truth image and reference depth
-        opacity: Rendering opacity mask (1, H, W)
-        uncertainty_network: MLP for uncertainty prediction
-        train_frac: Training progress (0-1) for adaptive weighting
-        ssim_frac: SSIM loss weight fraction
-        initialization: If True, skip exposure compensation
-        freeze_uncertainty_loss: If True, stops gradient flow through uncertainty loss
+        rendered_img: Rendered RGB image (torch.Tensor).
+        rendered_depth: Rendered depth map (torch.Tensor).
+        opacity: Opacity map (torch.Tensor).
+        viewpoint: Viewpoint object containing ground truth data and features.
+        uncertainty_network: Network to predict uncertainty from features.
+        map_utils: Utility functions for mapping loss computation.
+        config: Configuration dictionary.
+        train_frac: Fraction of training data to use for loss computation.
+        ssim_frac: Fraction of SSIM loss to use in RGB loss.
+        initialization: Whether the SLAM system is in initialization phase.
+        freeze_uncertainty_loss: Whether to freeze the uncertainty loss.
+        thermal_mask: Thermal mask for penalizing certain regions (torch.Tensor, optional).
+        thermal_image: Thermal image data (torch.Tensor, optional).
+        T_rgb_thermal: Transformation matrix from RGB to thermal camera (torch.Tensor, optional).
+        K_thermal: Intrinsic matrix of the thermal camera (torch.Tensor, optional).
+        gaussians: Gaussian components for SLAM (optional).
+        thermal_info: Dictionary containing thermal image data and calibration info (optional).
 
     Returns:
-        uncertainty: Per-pixel uncertainty estimates (H, W)
-        total_loss: Combined mapping and uncertainty loss (scalar)
+        uncertainty: Predicted uncertainty map (torch.Tensor).
+        total_loss: Combined mapping and uncertainty loss (scalar).
     """
     # Apply exposure compensation if not initialization
     rendered_img = rendered_img if initialization else (
@@ -255,6 +257,34 @@ def get_loss_mapping_uncertainty(
         config["uncertainty_params"]["ssim_mult"] * uncer_loss.mean()
     )
 
+    # Beta extension loss logic
+    # a. Retrieve calibrated thermal mask
+    thermal_mask = get_calibrated_thermal_mask(thermal_info['thermal_image'],
+                                               thermal_info['T_rgb_thermal'],
+                                               thermal_info['K_thermal'])
+
+    # b. Create boundary region mask M_boundary
+    kernel = torch.ones((1, 1, 3, 3), dtype=torch.float32, device=thermal_mask.device)
+    dilated_mask = F.conv2d(thermal_mask[None, None].float(), kernel, padding=1).clamp(0, 1)
+    eroded_mask = F.conv2d(thermal_mask[None, None].float(), -kernel, padding=1).clamp(0, 1)
+    boundary_mask = (dilated_mask - eroded_mask).abs().squeeze(0).squeeze(0)
+
+    # c. Compute beta extension loss
+    beta_values = gaussians.get_beta_values_in_mask(boundary_mask)
+    lambda_beta_ext = config['thermal'].get('lambda_beta_ext', 0.1)
+    loss_beta_ext = lambda_beta_ext * beta_values.sum()
+
+    # d. Add beta extension loss to total loss
+    total_loss += loss_beta_ext
+
+    # Log individual loss components
+    rgb_loss_mean = rgb_loss.mean().item()
+    depth_loss_mean = l1_depth.mean().item()
+    uncer_loss_mean = uncer_loss.mean().item()
+    beta_ext_loss = loss_beta_ext.item()
+
+    print(f"[LOSSES] RGB: {rgb_loss_mean:.2f}, Depth: {depth_loss_mean:.2f}, Uncer: {uncer_loss_mean:.2f}, BetaExt: {beta_ext_loss:.2f}")
+
     return uncertainty, total_loss
 
 def get_median_depth(depth, opacity=None, mask=None, return_std=False):
@@ -269,3 +299,44 @@ def get_median_depth(depth, opacity=None, mask=None, return_std=False):
     if return_std:
         return valid_depth.median(), valid_depth.std(), valid
     return valid_depth.median()
+
+def get_loss_mapping_rgbd(config, image, depth, viewpoint):
+    alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
+    rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
+    gt_image = viewpoint.original_image.cuda()
+    _, h, w = gt_image.shape
+    mask_shape = (1, h, w)
+
+    gt_depth = torch.from_numpy(viewpoint.depth).to(
+        dtype=torch.float32, device=image.device
+    )[
+        None
+    ]
+    loss = 0
+    if config["Training"]["ssim_loss"]:
+        ssim_loss = 1.0 - ssim(image, gt_image)
+
+    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
+    l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+    if config["Training"]["ssim_loss"]:
+        hyperparameter = config["opt_params"]["lambda_dssim"]
+        loss += (1.0 - hyperparameter) * l1_rgb + hyperparameter * ssim_loss
+    else:
+        loss += l1_rgb
+
+    depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
+    l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
+
+    # Apply thermal mask-based penalties
+    thermal_mask = None
+    if thermal_mask is not None:
+        thermal_mask = thermal_mask.to(device=rendered_img.device)
+        thermal_penalty = config['Training'].get('thermal_penalty_weight', 1.0)
+
+        # Scale RGB loss by thermal mask
+        rgb_loss = rgb_loss + thermal_penalty * (1.0 - thermal_mask) * rgb_loss
+
+        # Scale depth loss by thermal mask
+        l1_depth = l1_depth + thermal_penalty * (1.0 - thermal_mask) * l1_depth
+
+    return alpha * loss.mean() + (1 - alpha) * l1_depth.mean()

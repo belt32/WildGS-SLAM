@@ -1,0 +1,19 @@
+thermal:
+  T_rgb_thermal:  # External parameters (4x4 homogeneous transformation matrix)
+    - [1.0, 0.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0, 0.0]
+    - [0.0, 0.0, 1.0, 0.0]
+    - [0.0, 0.0, 0.0, 1.0]
+  K_thermal:  # Intrinsic parameters (3x3 matrix)
+    - [500.0, 0.0, 320.0]
+    - [0.0, 500.0, 240.0]
+    - [0.0, 0.0, 1.0]
+  thermal_threshold: 50.0  # Temperature threshold for thermal source detection
+  lambda_beta_ext: 0.1  # Weight for beta extension loss
+
+Mapping:
+  spatiotemporal_N: 5  # Number of frames to check in spatiotemporal filtering
+  spatiotemporal_threshold: 0.01  # Threshold for movement in meters
+
+Uncertainty_params:
+  beta_threshold: 0.9  # Threshold for penalizing beta values in boundary regions
